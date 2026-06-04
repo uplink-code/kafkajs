@@ -1,5 +1,4 @@
 const BrokerPool = require('./brokerPool')
-const Lock = require('../utils/lock')
 const sharedPromiseTo = require('../utils/sharedPromiseTo')
 const createRetry = require('../retry')
 const connectionPoolBuilder = require('./connectionPoolBuilder')
@@ -88,10 +87,8 @@ module.exports = class Cluster {
     })
 
     this.targetTopics = new Set()
-    this.mutatingTargetTopics = new Lock({
-      description: `updating target topics`,
-      timeout: requestTimeout,
-    })
+    /** @type {Map<string, Promise<void>>} */
+    this.inFlightMetadataByTopic = new Map()
     this.isolationLevel = isolationLevel
     this.brokerPool = new BrokerPool({
       connectionPoolBuilder: this.connectionPoolBuilder,
@@ -211,38 +208,67 @@ module.exports = class Cluster {
   /**
    * @public
    * @param {string[]} topics
-   * @return {Promise}
+   * @return {Promise<void>}
    */
   async addMultipleTargetTopics(topics) {
-    await this.mutatingTargetTopics.acquire()
+    const needsRefresh = topics.filter(
+      topic => !this.targetTopics.has(topic) || !this.brokerPool.metadata
+    )
 
-    try {
-      const previousSize = this.targetTopics.size
-      const previousTopics = new Set(this.targetTopics)
-      for (const topic of topics) {
-        this.targetTopics.add(topic)
-      }
+    if (needsRefresh.length === 0) return
 
-      const hasChanged = previousSize !== this.targetTopics.size || !this.brokerPool.metadata
+    await Promise.all(needsRefresh.map(topic => this.addTopicAndRefresh(topic)))
+  }
 
-      if (hasChanged) {
-        try {
+  /**
+   * Per-topic dedup of the refresh triggered by adding a target topic.
+   * Concurrent calls for the same topic share a single in-flight promise.
+   * Concurrent calls for different topics proceed without serializing on a
+   * global mutex — the shared metadata refresh underneath is already deduped
+   * by sharedPromiseTo, and rollback is per-topic instead of snapshot-restore,
+   * so there's nothing left for a lock to protect.
+   *
+   * @private
+   * @param {string} topic
+   * @returns {Promise<void>}
+   */
+  addTopicAndRefresh(topic) {
+    const existing = this.inFlightMetadataByTopic.get(topic)
+    if (existing) return existing
+
+    const wasNew = !this.targetTopics.has(topic)
+    this.targetTopics.add(topic)
+
+    const isInCache = () =>
+      !!this.brokerPool.metadata &&
+      !!this.brokerPool.metadata.topicMetadata &&
+      this.brokerPool.metadata.topicMetadata.some(t => t.topic === topic)
+
+    const promise = (async () => {
+      try {
+        await this.refreshMetadata()
+        if (!isInCache()) {
+          // The deduped refresh's topic snapshot predated our add. Force a
+          // fresh refresh here rather than letting the caller (e.g. produce)
+          // fail with KafkaJSMetadataNotLoaded and recover via its retry loop.
           await this.refreshMetadata()
-        } catch (e) {
-          if (
-            e.type === 'INVALID_TOPIC_EXCEPTION' ||
-            e.type === 'UNKNOWN_TOPIC_OR_PARTITION' ||
-            e.type === 'TOPIC_AUTHORIZATION_FAILED'
-          ) {
-            this.targetTopics = previousTopics
-          }
-
-          throw e
         }
+      } catch (e) {
+        if (
+          e.type === 'INVALID_TOPIC_EXCEPTION' ||
+          e.type === 'UNKNOWN_TOPIC_OR_PARTITION' ||
+          e.type === 'TOPIC_AUTHORIZATION_FAILED'
+        ) {
+          if (wasNew) this.targetTopics.delete(topic)
+        }
+        throw e
+      } finally {
+        this.inFlightMetadataByTopic.delete(topic)
       }
-    } finally {
-      await this.mutatingTargetTopics.release()
-    }
+    })()
+
+    this.inFlightMetadataByTopic.set(topic, promise)
+    return promise
   }
 
   /** @type {() => string[]} */

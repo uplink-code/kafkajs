@@ -66,9 +66,15 @@ module.exports = ({
   let producerSequence = {}
 
   /**
-   * Idempotent production requires a mutex lock per broker to serialize requests with sequence number handling
+   * Idempotent production requires a mutex lock per topic-partition to serialize sequence number assignment
    */
-  let brokerMutexLocks = {}
+  let partitionMutexLocks = {}
+
+  /**
+   * Per-partition promise chains to serialize network sends and ensure sequences arrive at Kafka in order.
+   * This avoids head-of-line blocking: sequence assignment is fast, and callers queue for network I/O.
+   */
+  let partitionSendChains = {}
 
   /**
    * Topic partitions already participating in the transaction
@@ -162,7 +168,8 @@ module.exports = ({
             producerId = result.producerId
             producerEpoch = result.producerEpoch
             producerSequence = {}
-            brokerMutexLocks = {}
+            partitionMutexLocks = {}
+            partitionSendChains = {}
 
             logger.debug('Initialized producer id & epoch', { producerId, producerEpoch })
           } catch (e) {
@@ -347,16 +354,91 @@ module.exports = ({
         return stateMachine.state() === STATES.TRANSACTING
       },
 
-      async acquireBrokerLock(broker) {
-        if (this.isInitialized()) {
-          brokerMutexLocks[broker.nodeId] =
-            brokerMutexLocks[broker.nodeId] || new Lock({ timeout: 0xffff })
-          await brokerMutexLocks[broker.nodeId].acquire()
+      /**
+       * Acquire locks for all topic-partitions in the request.
+       * Locks are acquired in sorted order to avoid deadlocks.
+       *
+       * @param {TopicData[]} topicData
+       * @returns {Promise<string[]>} The lock keys that were acquired (for releasing)
+       *
+       * @typedef {Object} TopicData
+       * @property {string} topic
+       * @property {object[]} partitions
+       * @property {number} partitions[].partition
+       */
+      async acquirePartitionLocks(topicData) {
+        if (!this.isInitialized()) {
+          return []
+        }
+
+        // Collect all topic-partition keys and sort to avoid deadlocks
+        const lockKeys = []
+        for (const { topic, partitions } of topicData) {
+          for (const { partition } of partitions) {
+            lockKeys.push(`${topic}:${partition}`)
+          }
+        }
+        lockKeys.sort()
+
+        // Acquire locks in sorted order
+        for (const key of lockKeys) {
+          partitionMutexLocks[key] = partitionMutexLocks[key] || new Lock({ timeout: 0xffff })
+          await partitionMutexLocks[key].acquire()
+        }
+
+        return lockKeys
+      },
+
+      /**
+       * Release locks for the given lock keys.
+       *
+       * @param {string[]} lockKeys
+       */
+      releasePartitionLocks(lockKeys) {
+        if (!this.isInitialized()) {
+          return
+        }
+
+        for (const key of lockKeys) {
+          if (partitionMutexLocks[key]) {
+            partitionMutexLocks[key].release()
+          }
         }
       },
 
-      releaseBrokerLock(broker) {
-        if (this.isInitialized()) brokerMutexLocks[broker.nodeId].release()
+      /**
+       * Enqueue a send operation to be executed in sequence order for the given partitions.
+       * This ensures that network sends happen in the order sequences were assigned,
+       * preventing OUT_OF_ORDER_SEQUENCE_NUMBER errors from Kafka.
+       *
+       * @param {string[]} lockKeys - The partition keys (topic:partition format)
+       * @param {() => Promise<T>} sendFn - The function that performs the actual send
+       * @returns {Promise<T>} - Resolves when the send completes
+       * @template T
+       */
+      enqueueSend(lockKeys, sendFn) {
+        if (!this.isInitialized() || lockKeys.length === 0) {
+          return sendFn()
+        }
+
+        // Wait for ALL partitions' previous sends to complete before starting this one.
+        // This ensures sequences arrive at Kafka in the order they were assigned.
+        const previousSends = lockKeys.map(key => partitionSendChains[key] || Promise.resolve())
+
+        const thisSend = Promise.all(previousSends)
+          .catch(() => {
+            // Ignore errors from previous sends - we still need to try ours
+          })
+          .then(() => sendFn())
+
+        // Update all partition chains to point to this send.
+        // Future sends to any of these partitions will wait for this one.
+        const chainPromise = thisSend.catch(() => {})
+        for (const key of lockKeys) {
+          partitionSendChains[key] = chainPromise
+        }
+
+        return thisSend
       },
 
       /**
