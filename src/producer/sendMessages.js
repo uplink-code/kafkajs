@@ -76,7 +76,8 @@ module.exports = ({ logger, cluster, partitioner, eosManager, retrier }) => {
 
         const topicData = createTopicData(topicDataForBroker)
 
-        await eosManager.acquireBrokerLock(broker)
+        // Acquire partition locks only for sequence assignment (fast operation)
+        const lockKeys = await eosManager.acquirePartitionLocks(topicData)
         try {
           if (eosManager.isTransactional()) {
             await eosManager.addPartitionsToTransaction(topicData)
@@ -88,10 +89,16 @@ module.exports = ({ logger, cluster, partitioner, eosManager, retrier }) => {
               eosManager.updateSequence(topic, entry.partition, entry.messages.length)
             })
           })
+        } finally {
+          // Release locks immediately after sequence assignment - don't hold during network I/O
+          eosManager.releasePartitionLocks(lockKeys)
+        }
 
-          let response
-          try {
-            response = await broker.produce({
+        // Enqueue the send to ensure network calls happen in sequence order.
+        // This prevents OUT_OF_ORDER_SEQUENCE_NUMBER errors without head-of-line blocking.
+        try {
+          const response = await eosManager.enqueueSend(lockKeys, () =>
+            broker.produce({
               transactionalId: eosManager.isTransactional()
                 ? eosManager.getTransactionalId()
                 : undefined,
@@ -102,24 +109,21 @@ module.exports = ({ logger, cluster, partitioner, eosManager, retrier }) => {
               compression,
               topicData,
             })
-          } catch (e) {
-            topicData.forEach(({ topic, partitions }) => {
-              partitions.forEach(entry => {
-                eosManager.updateSequence(topic, entry.partition, -entry.messages.length)
-              })
-            })
-            throw e
-          }
+          )
 
           const expectResponse = acks !== 0
           const formattedResponse = expectResponse ? responseSerializer(response) : []
 
           responsePerBroker.set(broker, formattedResponse)
         } catch (e) {
+          // Rollback sequences on failure so retry gets the same sequences
+          topicData.forEach(({ topic, partitions }) => {
+            partitions.forEach(entry => {
+              eosManager.updateSequence(topic, entry.partition, -entry.messages.length)
+            })
+          })
           responsePerBroker.delete(broker)
           throw e
-        } finally {
-          await eosManager.releaseBrokerLock(broker)
         }
       })
     }
